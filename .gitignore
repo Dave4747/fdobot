@@ -1,0 +1,6 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+applications.json
+twitch_alert_state.json
