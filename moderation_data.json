@@ -1,0 +1,18 @@
+{
+    "cases": [
+        {
+            "case_id": 1,
+            "guild_id": 1482869520497639508,
+            "user_id": 404019045357322250,
+            "user_tag": "d.4ve",
+            "moderator_id": 404019045357322250,
+            "moderator_tag": "d.4ve",
+            "action": "Purge",
+            "reason": "Purged 1 message(s) in #staff-chat.",
+            "duration": null,
+            "evidence": null,
+            "timestamp": "2026-03-22T06:48:12.010656+00:00"
+        }
+    ],
+    "case_counter": 1
+}

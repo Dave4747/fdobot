@@ -1,21 +1,25 @@
+import asyncio
 import io
 import json
 import os
 import re
 from datetime import datetime
+from typing import Dict, Optional
 
 import discord
 from discord.ext import commands
 
 DATA_FILE = "applications.json"
-REVIEW_CHANNEL_NAME = "📄application-reviews"  # change if needed
+
 APPLICATION_CATEGORY_NAME = "Applications"
+APPLY_PANEL_CHANNEL_ID = 1482938874937217025
 
-DONUT_ROLE_NAME = "Contestant"
-MINIGAMES_ROLE_NAME = "Mini-Games Contestant"
+DONUT_ROLE_NAME = "Donut Games"
+SUPPORT_ROLE_KEYWORD = "support"
+DONUT_BUTTON_EMOJI = "🍩"
 
 
-def load_data():
+def load_data() -> dict:
     if not os.path.exists(DATA_FILE):
         return {
             "active_applications": {},
@@ -33,74 +37,155 @@ def load_data():
     return data
 
 
-def save_data(data):
+def save_data(data: dict) -> None:
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4)
 
 
-def safe_channel_name(text: str) -> str:
-    text = text.lower().strip()
-    text = re.sub(r"[^a-z0-9-]", "-", text)
-    text = re.sub(r"-+", "-", text).strip("-")
-    return text[:90]
-
-
-def normalize_active_applications(data):
-    """
-    Upgrades old formats safely into:
-    active_applications[user_id][app_type] = {
-        "channel_id": int,
-        "app_type": str,
-        "review_message_id": int | None
-    }
-    """
+def normalize_data(data: dict) -> dict:
     active = data.get("active_applications", {})
-    normalized = {}
+    normalized_active = {}
 
     for user_id_str, value in active.items():
-        # Old format: "123": 4567890123
         if isinstance(value, int):
-            normalized[user_id_str] = {
+            normalized_active[user_id_str] = {
                 "Donut Games": {
                     "channel_id": value,
-                    "app_type": "Donut Games",
-                    "review_message_id": None
+                    "app_type": "Donut Games"
                 }
             }
             continue
 
-        # Old format: "123": {"channel_id": ..., "app_type": ...}
         if isinstance(value, dict) and "channel_id" in value:
             app_type = value.get("app_type", "Donut Games")
-            normalized[user_id_str] = {
-                app_type: {
-                    "channel_id": value["channel_id"],
-                    "app_type": app_type,
-                    "review_message_id": value.get("review_message_id")
+            if app_type == "Donut Games":
+                normalized_active[user_id_str] = {
+                    "Donut Games": {
+                        "channel_id": value["channel_id"],
+                        "app_type": "Donut Games"
+                    }
                 }
-            }
             continue
 
-        # New format already
         if isinstance(value, dict):
-            normalized[user_id_str] = {}
+            user_apps = {}
             for app_type, app_data in value.items():
-                if isinstance(app_data, dict) and "channel_id" in app_data:
-                    normalized[user_id_str][app_type] = {
+                if (
+                    app_type == "Donut Games"
+                    and isinstance(app_data, dict)
+                    and "channel_id" in app_data
+                ):
+                    user_apps["Donut Games"] = {
                         "channel_id": app_data["channel_id"],
-                        "app_type": app_data.get("app_type", app_type),
-                        "review_message_id": app_data.get("review_message_id")
+                        "app_type": "Donut Games"
                     }
 
-    data["active_applications"] = normalized
+            if user_apps:
+                normalized_active[user_id_str] = user_apps
+
+    data["active_applications"] = normalized_active
+
+    user_status = data.get("user_status", {})
+    normalized_status = {}
+
+    for user_id_str, value in user_status.items():
+        if isinstance(value, str):
+            normalized_status[user_id_str] = {"Donut Games": value}
+        elif isinstance(value, dict):
+            if "Donut Games" in value:
+                normalized_status[user_id_str] = {"Donut Games": value["Donut Games"]}
+
+    data["user_status"] = normalized_status
     return data
 
 
+def clean_username_for_channel(name: str) -> str:
+    cleaned = name.lower().strip()
+    cleaned = re.sub(r"\s+", "-", cleaned)
+    cleaned = re.sub(r"[^a-z0-9._-]", "", cleaned)
+    cleaned = re.sub(r"-+", "-", cleaned).strip("-")
+    return cleaned[:40] if cleaned else "user"
+
+
+def build_application_channel_name(username: str) -> str:
+    safe_user = clean_username_for_channel(username)
+    name = f"🍩┃{safe_user}"
+    return name[:90]
+
+
+def get_support_roles(guild: discord.Guild):
+    return [role for role in guild.roles if SUPPORT_ROLE_KEYWORD in role.name.lower()]
+
+
+def is_support_staff(member: discord.Member) -> bool:
+    if (
+        member.guild_permissions.administrator
+        or member.guild_permissions.manage_guild
+        or member.guild_permissions.manage_channels
+    ):
+        return True
+
+    return any(SUPPORT_ROLE_KEYWORD in role.name.lower() for role in member.roles)
+
+
+def get_application_status(data: dict, user_id: int, app_type: str) -> Optional[str]:
+    value = data.get("user_status", {}).get(str(user_id))
+
+    if isinstance(value, str):
+        return value if app_type == "Donut Games" else None
+
+    if isinstance(value, dict):
+        return value.get(app_type)
+
+    return None
+
+
+async def set_application_status(user_id: int, app_type: str, status: str) -> None:
+    data = normalize_data(load_data())
+    user_id_str = str(user_id)
+
+    if user_id_str not in data["user_status"]:
+        data["user_status"][user_id_str] = {}
+
+    if isinstance(data["user_status"][user_id_str], str):
+        old_status = data["user_status"][user_id_str]
+        data["user_status"][user_id_str] = {"Donut Games": old_status}
+
+    data["user_status"][user_id_str][app_type] = status
+    save_data(data)
+
+
+def remove_active_application(user_id: int, app_type: str) -> None:
+    data = normalize_data(load_data())
+    user_id_str = str(user_id)
+
+    user_apps = data["active_applications"].get(user_id_str, {})
+    if isinstance(user_apps, dict):
+        user_apps.pop(app_type, None)
+        if not user_apps:
+            data["active_applications"].pop(user_id_str, None)
+
+    save_data(data)
+
+
+async def assign_donut_role(guild: discord.Guild, member: discord.Member):
+    role = discord.utils.get(guild.roles, name=DONUT_ROLE_NAME)
+    if role is None:
+        return False, DONUT_ROLE_NAME
+
+    try:
+        await member.add_roles(role, reason="Application accepted for Donut Games")
+        return True, DONUT_ROLE_NAME
+    except discord.Forbidden:
+        return False, DONUT_ROLE_NAME
+
+
 async def build_transcript(channel: discord.TextChannel) -> discord.File:
-    lines = []
-    lines.append(f"Transcript for #{channel.name}")
-    lines.append(f"Generated: {datetime.utcnow().isoformat()} UTC")
-    lines.append("-" * 60)
+    lines = [
+        f"Transcript for #{channel.name}",
+        f"Generated: {datetime.utcnow().isoformat()} UTC",
+        "-" * 60
+    ]
 
     messages = [msg async for msg in channel.history(limit=None, oldest_first=True)]
 
@@ -114,10 +199,11 @@ async def build_transcript(channel: discord.TextChannel) -> discord.File:
 
         if msg.embeds:
             for idx, embed in enumerate(msg.embeds, start=1):
-                embed_title = embed.title or "No title"
-                embed_desc = embed.description or "No description"
-                lines.append(f"[Embed {idx}] {embed_title}")
-                lines.append(embed_desc)
+                lines.append(f"[Embed {idx}] {embed.title or 'No title'}")
+                lines.append(embed.description or "No description")
+                for field in embed.fields:
+                    lines.append(f"[Field] {field.name}")
+                    lines.append(field.value)
 
         if msg.attachments:
             for attachment in msg.attachments:
@@ -130,13 +216,13 @@ async def build_transcript(channel: discord.TextChannel) -> discord.File:
     return discord.File(transcript_bytes, filename=f"{channel.name}-transcript.txt")
 
 
-async def send_transcript_and_message(
+async def dm_transcript(
     member: discord.Member,
     channel: discord.TextChannel,
     title: str,
     description: str
-):
-    transcript_file = await build_transcript(channel)
+) -> bool:
+    transcript = await build_transcript(channel)
 
     embed = discord.Embed(
         title=title,
@@ -145,80 +231,206 @@ async def send_transcript_and_message(
     )
 
     try:
-        await member.send(embed=embed, file=transcript_file)
+        await member.send(embed=embed, file=transcript)
         return True
     except discord.Forbidden:
         return False
 
 
-async def cleanup_application(channel: discord.TextChannel, user_id: int, app_type: str):
-    data = normalize_active_applications(load_data())
-    user_id_str = str(user_id)
+class ActionCountdownView(discord.ui.View):
+    def __init__(
+        self,
+        applicant_id: int,
+        app_channel: discord.TextChannel,
+        app_type: str,
+        action: str,
+        acted_by: discord.Member,
+        reason: Optional[str] = None
+    ):
+        super().__init__(timeout=15)
+        self.applicant_id = applicant_id
+        self.app_channel = app_channel
+        self.app_type = app_type
+        self.action = action
+        self.acted_by = acted_by
+        self.reason = reason
+        self.cancelled = False
+        self.message: Optional[discord.Message] = None
 
-    user_apps = data["active_applications"].get(user_id_str, {})
-    if isinstance(user_apps, dict):
-        user_apps.pop(app_type, None)
-        if not user_apps:
-            data["active_applications"].pop(user_id_str, None)
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
 
-    save_data(data)
+    async def begin(self, message: discord.Message):
+        self.message = message
 
-    try:
-        await channel.delete()
-    except discord.Forbidden:
-        pass
+        for seconds_left in range(10, 0, -1):
+            if self.cancelled:
+                return
 
+            if self.action == "accept":
+                title = "⏳ Acceptance Scheduled"
+                description = (
+                    f"This application will be **accepted and closed in {seconds_left} seconds**.\n\n"
+                    "Press **Cancel** below to stop it."
+                )
+                color = discord.Color.green()
+            elif self.action == "deny":
+                title = "⏳ Denial Scheduled"
+                description = (
+                    f"This application will be **denied and closed in {seconds_left} seconds**.\n\n"
+                    f"**Reason:** {self.reason or 'No reason provided.'}\n\n"
+                    "Press **Cancel** below to stop it."
+                )
+                color = discord.Color.orange()
+            else:
+                title = "⏳ Close Scheduled"
+                description = (
+                    f"This application will be **closed in {seconds_left} seconds**.\n\n"
+                    f"**Reason:** {self.reason or 'Closed by staff.'}\n\n"
+                    "Press **Cancel** below to stop it."
+                )
+                color = discord.Color.orange()
 
-async def set_application_status(user_id: int, app_type: str, status: str):
-    data = normalize_active_applications(load_data())
-    user_id_str = str(user_id)
+            embed = discord.Embed(title=title, description=description, color=color)
 
-    if user_id_str not in data["user_status"]:
-        data["user_status"][user_id_str] = {}
+            try:
+                await message.edit(embed=embed, view=self)
+            except discord.HTTPException:
+                return
 
-    if isinstance(data["user_status"][user_id_str], str):
-        # Upgrade old format
-        old_status = data["user_status"][user_id_str]
-        data["user_status"][user_id_str] = {"Donut Games": old_status}
+            await asyncio.sleep(1)
 
-    data["user_status"][user_id_str][app_type] = status
-    save_data(data)
+        if not self.cancelled:
+            await self.finish_action()
 
+    async def finish_action(self):
+        guild = self.app_channel.guild
+        applicant = guild.get_member(self.applicant_id)
 
-def get_application_status(data, user_id: int, app_type: str):
-    value = data.get("user_status", {}).get(str(user_id))
+        if self.action == "accept":
+            await set_application_status(self.applicant_id, self.app_type, "accepted")
 
-    if isinstance(value, str):
-        return value if app_type == "Donut Games" else None
+            role_text = ""
+            dm_sent = False
 
-    if isinstance(value, dict):
-        return value.get(app_type)
+            if applicant:
+                role_success, role_name = await assign_donut_role(guild, applicant)
+                if role_success:
+                    role_text = f"You have been given the **{role_name}** role."
+                else:
+                    role_text = f"We could not assign the **{role_name}** role automatically."
 
-    return None
+                dm_sent = await dm_transcript(
+                    applicant,
+                    self.app_channel,
+                    "✅ Application Accepted",
+                    (
+                        f"Congratulations — your **{self.app_type}** application has been accepted.\n\n"
+                        f"{role_text}\n\n"
+                        "Your application channel has now been closed."
+                    )
+                )
 
+            await self.app_channel.send(
+                embed=discord.Embed(
+                    title="✅ Application Accepted",
+                    description=(
+                        f"Accepted by {self.acted_by.mention}.\n"
+                        + ("The applicant has been notified." if dm_sent else "Could not DM the applicant.")
+                    ),
+                    color=discord.Color.green()
+                )
+            )
 
-async def assign_role_by_app_type(guild: discord.Guild, member: discord.Member, app_type: str):
-    if app_type == "Donut Games":
-        role_name = DONUT_ROLE_NAME
-    else:
-        role_name = MINIGAMES_ROLE_NAME
+        elif self.action == "deny":
+            await set_application_status(self.applicant_id, self.app_type, "denied")
 
-    role = discord.utils.get(guild.roles, name=role_name)
-    if role is None:
-        return False, role_name
+            dm_sent = False
+            if applicant:
+                dm_sent = await dm_transcript(
+                    applicant,
+                    self.app_channel,
+                    "❌ Application Denied",
+                    (
+                        f"Thank you for applying for **{self.app_type}**.\n\n"
+                        f"**Reason:** {self.reason or 'No reason provided.'}\n\n"
+                        "You can retry with a stronger application."
+                    )
+                )
 
-    try:
-        await member.add_roles(role, reason=f"Application accepted for {app_type}")
-        return True, role_name
-    except discord.Forbidden:
-        return False, role_name
+            await self.app_channel.send(
+                embed=discord.Embed(
+                    title="❌ Application Denied",
+                    description=(
+                        f"Denied by {self.acted_by.mention}.\n"
+                        + ("The applicant has been notified." if dm_sent else "Could not DM the applicant.")
+                    ),
+                    color=discord.Color.red()
+                )
+            )
+
+        else:
+            dm_sent = False
+            if applicant:
+                dm_sent = await dm_transcript(
+                    applicant,
+                    self.app_channel,
+                    "🔒 Application Closed",
+                    (
+                        f"Your **{self.app_type}** application channel was closed.\n\n"
+                        f"**Reason:** {self.reason or 'Closed by staff.'}"
+                    )
+                )
+
+            await self.app_channel.send(
+                embed=discord.Embed(
+                    title="🔒 Application Closed",
+                    description=(
+                        f"Closed by {self.acted_by.mention}.\n"
+                        + ("The applicant has been notified." if dm_sent else "Could not DM the applicant.")
+                    ),
+                    color=discord.Color.blurple()
+                )
+            )
+
+        remove_active_application(self.applicant_id, self.app_type)
+
+        try:
+            await self.app_channel.delete()
+        except discord.Forbidden:
+            pass
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, emoji="🛑")
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member) or not is_support_staff(interaction.user):
+            await interaction.response.send_message("❌ Only support staff can cancel this action.", ephemeral=True)
+            return
+
+        self.cancelled = True
+        for item in self.children:
+            item.disabled = True
+
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="✅ Cancelled",
+                description="This action has been cancelled. The application will stay open.",
+                color=discord.Color.green()
+            ),
+            view=self
+        )
 
 
 class DenyReasonModal(discord.ui.Modal, title="Deny Application"):
     deny_reason = discord.ui.TextInput(
-        label="Reason for denial",
+        label="Optional reason",
         style=discord.TextStyle.paragraph,
-        placeholder="Write the reason the application is being denied...",
+        placeholder="Leave blank to use the default retry message.",
         required=False,
         max_length=1000
     )
@@ -230,62 +442,107 @@ class DenyReasonModal(discord.ui.Modal, title="Deny Application"):
         self.app_type = app_type
 
     async def on_submit(self, interaction: discord.Interaction):
+        if not isinstance(interaction.user, discord.Member) or not is_support_staff(interaction.user):
+            await interaction.response.send_message("❌ Only support staff can deny applications.", ephemeral=True)
+            return
+
         guild = interaction.guild
         if guild is None:
-            await interaction.response.send_message(
-                "❌ This action can only be used in a server.",
-                ephemeral=True
-            )
+            await interaction.response.send_message("❌ This can only be used in a server.", ephemeral=True)
             return
 
-        if not (
-            interaction.user.guild_permissions.administrator
-            or interaction.user.guild_permissions.manage_guild
-        ):
-            await interaction.response.send_message(
-                "❌ You do not have permission to deny applications.",
-                ephemeral=True
-            )
+        channel = guild.get_channel(self.app_channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            await interaction.response.send_message("❌ The application channel no longer exists.", ephemeral=True)
             return
 
-        member = guild.get_member(self.applicant_id)
-        app_channel = guild.get_channel(self.app_channel_id)
+        reason = self.deny_reason.value.strip() or "Your application was not accepted this time, but you are welcome to retry with a stronger application."
 
-        custom_reason = self.deny_reason.value.strip()
-        if not custom_reason:
-            custom_reason = (
-                "Your application was not accepted at this time. "
-                "This may be due to fit, effort, selection limits, or overall review decisions."
-            )
-
-        await set_application_status(self.applicant_id, self.app_type, "denied")
-
-        dm_sent = False
-        if member and app_channel:
-            dm_sent = await send_transcript_and_message(
-                member,
-                app_channel,
-                "❌ Application Denied",
-                (
-                    f"Thanks for taking the time to apply for **{self.app_type}**.\n\n"
-                    f"**Reason:** {custom_reason}\n\n"
-                    "Sorry, but your application was not successful this time."
-                )
-            )
-
-        if app_channel:
-            await cleanup_application(app_channel, self.applicant_id, self.app_type)
-
-        await interaction.response.send_message(
-            (
-                f"✅ Denied <@{self.applicant_id}>'s application."
-                + (" Transcript + message sent." if dm_sent else " Could not DM the player.")
-            ),
-            ephemeral=True
+        countdown_view = ActionCountdownView(
+            applicant_id=self.applicant_id,
+            app_channel=channel,
+            app_type=self.app_type,
+            action="deny",
+            reason=reason,
+            acted_by=interaction.user
         )
 
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="⏳ Denial Scheduled",
+                description=(
+                    f"This application will be **denied and closed in 10 seconds**.\n\n"
+                    f"**Reason:** {reason}\n\n"
+                    "Press **Cancel** below to stop it."
+                ),
+                color=discord.Color.orange()
+            ),
+            view=countdown_view
+        )
 
-class ReviewView(discord.ui.View):
+        countdown_message = await interaction.original_response()
+        asyncio.create_task(countdown_view.begin(countdown_message))
+
+
+class CloseReasonModal(discord.ui.Modal, title="Close Application"):
+    close_reason = discord.ui.TextInput(
+        label="Optional reason",
+        style=discord.TextStyle.paragraph,
+        placeholder="Leave blank to use a default close message.",
+        required=False,
+        max_length=1000
+    )
+
+    def __init__(self, applicant_id: int, app_channel_id: int, app_type: str):
+        super().__init__()
+        self.applicant_id = applicant_id
+        self.app_channel_id = app_channel_id
+        self.app_type = app_type
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not isinstance(interaction.user, discord.Member) or not is_support_staff(interaction.user):
+            await interaction.response.send_message("❌ Only support staff can close applications.", ephemeral=True)
+            return
+
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("❌ This can only be used in a server.", ephemeral=True)
+            return
+
+        channel = guild.get_channel(self.app_channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            await interaction.response.send_message("❌ The application channel no longer exists.", ephemeral=True)
+            return
+
+        reason = self.close_reason.value.strip() or "Closed by staff."
+
+        countdown_view = ActionCountdownView(
+            applicant_id=self.applicant_id,
+            app_channel=channel,
+            app_type=self.app_type,
+            action="close",
+            reason=reason,
+            acted_by=interaction.user
+        )
+
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="⏳ Close Scheduled",
+                description=(
+                    f"This application will be **closed in 10 seconds**.\n\n"
+                    f"**Reason:** {reason}\n\n"
+                    "Press **Cancel** below to stop it."
+                ),
+                color=discord.Color.orange()
+            ),
+            view=countdown_view
+        )
+
+        countdown_message = await interaction.original_response()
+        asyncio.create_task(countdown_view.begin(countdown_message))
+
+
+class ApplicationDecisionView(discord.ui.View):
     def __init__(self, bot, applicant_id: int, app_channel_id: int, app_type: str):
         super().__init__(timeout=None)
         self.bot = bot
@@ -294,391 +551,383 @@ class ReviewView(discord.ui.View):
         self.app_type = app_type
 
     async def _staff_check(self, interaction: discord.Interaction) -> bool:
-        if (
-            interaction.user.guild_permissions.administrator
-            or interaction.user.guild_permissions.manage_guild
-        ):
+        if isinstance(interaction.user, discord.Member) and is_support_staff(interaction.user):
             return True
 
-        await interaction.response.send_message(
-            "❌ You do not have permission to use these buttons.",
-            ephemeral=True
-        )
+        await interaction.response.send_message("❌ Only support staff can use these buttons.", ephemeral=True)
         return False
 
-    @discord.ui.button(
-        label="Under Review",
-        style=discord.ButtonStyle.secondary,
-        emoji="🟡",
-        custom_id="review_under_review"
-    )
+    @discord.ui.button(label="Under Review", style=discord.ButtonStyle.secondary, emoji="🟡", custom_id="donut_app_under_review")
     async def under_review(self, interaction: discord.Interaction, button: discord.ui.Button):
-        try:
-            if not await self._staff_check(interaction):
-                return
+        if not await self._staff_check(interaction):
+            return
 
-            guild = interaction.guild
-            if guild is None:
-                await interaction.response.send_message("❌ Guild not found.", ephemeral=True)
-                return
+        await set_application_status(self.applicant_id, self.app_type, "under_review")
 
-            await set_application_status(self.applicant_id, self.app_type, "under_review")
-
-            member = guild.get_member(self.applicant_id)
-            app_channel = guild.get_channel(self.app_channel_id)
-
-            if app_channel:
-                embed = discord.Embed(
-                    title="🟡 Application Update",
-                    description=(
-                        f"Your **{self.app_type}** application is now **under review**.\n\n"
-                        "Staff are currently looking through it and will update you once a decision has been made."
-                    ),
-                    color=discord.Color.yellow()
-                )
-                await app_channel.send(embed=embed)
-
-            if member:
-                try:
-                    await member.send(
-                        embed=discord.Embed(
-                            title="🟡 Application Under Review",
-                            description=f"Your **{self.app_type}** application is now under review.",
-                            color=discord.Color.yellow()
-                        )
-                    )
-                except discord.Forbidden:
-                    pass
-
-            await interaction.response.send_message(
-                f"✅ Marked <@{self.applicant_id}>'s application as under review.",
-                ephemeral=True
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="🟡 Application Marked Under Review",
+                description=f"{interaction.user.mention} marked this application as under review.",
+                color=discord.Color.yellow()
             )
+        )
 
-        except Exception as e:
-            if not interaction.response.is_done():
-                await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
-            else:
-                await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
-
-    @discord.ui.button(
-        label="Accept",
-        style=discord.ButtonStyle.success,
-        emoji="✅",
-        custom_id="review_accept"
-    )
+    @discord.ui.button(label="Accept", style=discord.ButtonStyle.success, emoji="✅", custom_id="donut_app_accept")
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
-        try:
-            if not await self._staff_check(interaction):
-                return
+        if not await self._staff_check(interaction):
+            return
 
-            guild = interaction.guild
-            if guild is None:
-                await interaction.response.send_message("❌ Guild not found.", ephemeral=True)
-                return
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("❌ Guild not found.", ephemeral=True)
+            return
 
-            member = guild.get_member(self.applicant_id)
-            app_channel = guild.get_channel(self.app_channel_id)
+        channel = guild.get_channel(self.app_channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            await interaction.response.send_message("❌ Application channel not found.", ephemeral=True)
+            return
 
-            if app_channel is None:
-                await interaction.response.send_message(
-                    "❌ The application channel no longer exists.",
-                    ephemeral=True
-                )
-                return
+        countdown_view = ActionCountdownView(
+            applicant_id=self.applicant_id,
+            app_channel=channel,
+            app_type=self.app_type,
+            action="accept",
+            acted_by=interaction.user
+        )
 
-            await set_application_status(self.applicant_id, self.app_type, "accepted")
-
-            role_result = None
-            if member:
-                role_result = await assign_role_by_app_type(guild, member, self.app_type)
-
-            dm_sent = False
-            if member and app_channel:
-                dm_sent = await send_transcript_and_message(
-                    member,
-                    app_channel,
-                    "✅ Application Accepted",
-                    (
-                        f"Congratulations — your **{self.app_type}** application has been accepted.\n\n"
-                        "Your application channel has now been closed and your next steps will be handled through the server."
-                    )
-                )
-
-            if app_channel:
-                await cleanup_application(app_channel, self.applicant_id, self.app_type)
-
-            role_text = ""
-            if role_result is not None:
-                success, role_name = role_result
-                if success:
-                    role_text = f" Role **{role_name}** assigned."
-                else:
-                    role_text = f" Could not assign role **{role_name}**."
-
-            await interaction.response.send_message(
-                (
-                    f"✅ Accepted <@{self.applicant_id}>'s application."
-                    + role_text
-                    + (" Transcript + message sent." if dm_sent else " Could not DM the player.")
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="⏳ Acceptance Scheduled",
+                description=(
+                    "This application will be **accepted and closed in 10 seconds**.\n\n"
+                    "Press **Cancel** below to stop it."
                 ),
-                ephemeral=True
-            )
+                color=discord.Color.green()
+            ),
+            view=countdown_view
+        )
 
-        except Exception as e:
-            if not interaction.response.is_done():
-                await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
-            else:
-                await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+        countdown_message = await interaction.original_response()
+        asyncio.create_task(countdown_view.begin(countdown_message))
 
-    @discord.ui.button(
-        label="Deny",
-        style=discord.ButtonStyle.danger,
-        emoji="❌",
-        custom_id="review_deny"
-    )
+    @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger, emoji="❌", custom_id="donut_app_deny")
     async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
-        try:
-            if not await self._staff_check(interaction):
-                return
+        if not await self._staff_check(interaction):
+            return
 
-            await interaction.response.send_modal(
-                DenyReasonModal(
-                    applicant_id=self.applicant_id,
-                    app_channel_id=self.app_channel_id,
-                    app_type=self.app_type
-                )
+        await interaction.response.send_modal(
+            DenyReasonModal(
+                applicant_id=self.applicant_id,
+                app_channel_id=self.app_channel_id,
+                app_type=self.app_type
             )
+        )
 
-        except Exception as e:
-            if not interaction.response.is_done():
-                await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
-            else:
-                await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+    @discord.ui.button(label="Close", style=discord.ButtonStyle.secondary, emoji="🔒", custom_id="donut_app_close")
+    async def close_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._staff_check(interaction):
+            return
+
+        await interaction.response.send_modal(
+            CloseReasonModal(
+                applicant_id=self.applicant_id,
+                app_channel_id=self.app_channel_id,
+                app_type=self.app_type
+            )
+        )
 
 
-class ApplicationView(discord.ui.View):
-    def __init__(self, bot):
-        super().__init__(timeout=None)
-        self.bot = bot
+class ApplicationPartTwoModal(discord.ui.Modal, title="Donut Games Application • Part 2"):
+    def __init__(self, cog: "Tickets", part_one_answers: Dict[str, str]):
+        super().__init__()
+        self.cog = cog
+        self.part_one_answers = part_one_answers
 
-    @discord.ui.select(
-        custom_id="application_select",
-        placeholder="Choose what you want to apply for...",
-        min_values=1,
-        max_values=1,
-        options=[
-            discord.SelectOption(
-                label="Donut Games Application",
-                description="Apply for the main Donut Games competition.",
-                emoji="🍩"
-            ),
-            discord.SelectOption(
-                label="Mini-Games Application",
-                description="Apply for live stream mini-games and fun events.",
-                emoji="🎮"
-            ),
-        ]
-    )
-    async def select_callback(self, interaction: discord.Interaction, select: discord.ui.Select):
+        self.where_found_us = discord.ui.TextInput(
+            label="Where did you find us?",
+            required=True,
+            max_length=200,
+            placeholder="YouTube, TikTok, Discord, friend, etc."
+        )
+        self.have_competed_before = discord.ui.TextInput(
+            label="Have you competed in the games before?",
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=1000,
+            placeholder="If so, tell us more."
+        )
+        self.follow_rules = discord.ui.TextInput(
+            label="Will you follow the rules and not grief?",
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=500
+        )
+        self.anything_else = discord.ui.TextInput(
+            label="Anything else you would like to add?",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=1000
+        )
+
+        self.add_item(self.where_found_us)
+        self.add_item(self.have_competed_before)
+        self.add_item(self.follow_rules)
+        self.add_item(self.anything_else)
+
+    async def on_submit(self, interaction: discord.Interaction):
         try:
             guild = interaction.guild
             user = interaction.user
-            choice = select.values[0]
+            app_type = "Donut Games"
 
-            if guild is None:
-                await interaction.response.send_message(
-                    "❌ This can only be used inside a server.",
-                    ephemeral=True
-                )
+            if guild is None or not isinstance(user, discord.Member):
+                await interaction.response.send_message("❌ This can only be used inside a server.", ephemeral=True)
                 return
 
-            data = normalize_active_applications(load_data())
+            data = normalize_data(load_data())
             user_id_str = str(user.id)
 
-            if user_id_str not in data["active_applications"]:
-                data["active_applications"][user_id_str] = {}
-
-            if choice == "Donut Games Application":
-                app_type = "Donut Games"
-            else:
-                app_type = "Mini-Games"
-
-            # Admins can bypass open-app check
-            if not interaction.user.guild_permissions.administrator:
-                existing_app = data["active_applications"].get(user_id_str, {}).get(app_type)
-                if existing_app:
-                    existing_channel = guild.get_channel(existing_app["channel_id"])
-                    if existing_channel:
-                        await interaction.response.send_message(
-                            f"❌ You already have an open **{app_type}** application: {existing_channel.mention}",
-                            ephemeral=True
-                        )
-                        return
-                    else:
-                        data["active_applications"][user_id_str].pop(app_type, None)
-                        if not data["active_applications"][user_id_str]:
-                            data["active_applications"].pop(user_id_str, None)
-                        save_data(data)
-
-                status = get_application_status(data, user.id, app_type)
-                if status == "denied":
+            existing_app = data["active_applications"].get(user_id_str, {}).get(app_type)
+            if existing_app:
+                existing_channel = guild.get_channel(existing_app["channel_id"])
+                if existing_channel:
                     await interaction.response.send_message(
-                        f"❌ You cannot open a new **{app_type}** application because a previous one was denied.",
+                        f"❌ You already have an open **{app_type}** application: {existing_channel.mention}",
                         ephemeral=True
                     )
                     return
+                else:
+                    data["active_applications"].get(user_id_str, {}).pop(app_type, None)
+                    if user_id_str in data["active_applications"] and not data["active_applications"][user_id_str]:
+                        data["active_applications"].pop(user_id_str, None)
+                    save_data(data)
 
             category = discord.utils.get(guild.categories, name=APPLICATION_CATEGORY_NAME)
             if category is None:
                 category = await guild.create_category(APPLICATION_CATEGORY_NAME)
 
-            review_channel = discord.utils.get(guild.text_channels, name=REVIEW_CHANNEL_NAME)
-            if review_channel is None:
-                await interaction.response.send_message(
-                    f"❌ Staff review channel `#{REVIEW_CHANNEL_NAME}` was not found.",
-                    ephemeral=True
-                )
-                return
-
-            base_name = safe_channel_name(f"app-{user.name}-{app_type}")
+            base_name = build_application_channel_name(user.name)
             channel_name = base_name
             count = 1
 
             while discord.utils.get(guild.channels, name=channel_name):
                 count += 1
-                channel_name = f"{base_name}-{count}"
+                channel_name = f"{base_name[:80]}-{count}"
 
-            channel = await guild.create_text_channel(channel_name, category=category)
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                user: discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True,
+                    attach_files=True,
+                    embed_links=True
+                )
+            }
 
-            await channel.set_permissions(user, read_messages=True, send_messages=True)
-            await channel.set_permissions(guild.default_role, read_messages=False)
+            support_roles = get_support_roles(guild)
+            for role in support_roles:
+                overwrites[role] = discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True,
+                    manage_messages=True
+                )
 
             for role in guild.roles:
-                if role.permissions.administrator or role.permissions.manage_guild:
-                    await channel.set_permissions(role, read_messages=True, send_messages=True)
+                if role.permissions.administrator or role.permissions.manage_guild or role.permissions.manage_channels:
+                    overwrites[role] = discord.PermissionOverwrite(
+                        view_channel=True,
+                        send_messages=True,
+                        read_message_history=True,
+                        manage_messages=True
+                    )
+
+            channel = await guild.create_text_channel(channel_name, category=category, overwrites=overwrites)
 
             data["active_applications"].setdefault(user_id_str, {})
             data["active_applications"][user_id_str][app_type] = {
                 "channel_id": channel.id,
-                "app_type": app_type,
-                "review_message_id": None
+                "app_type": app_type
             }
+
             data["user_status"].setdefault(user_id_str, {})
             if isinstance(data["user_status"][user_id_str], str):
                 old = data["user_status"][user_id_str]
                 data["user_status"][user_id_str] = {"Donut Games": old}
+
             data["user_status"][user_id_str][app_type] = "open"
             save_data(data)
 
-            if app_type == "Donut Games":
-                intro_embed = discord.Embed(
-                    title="🍩 Donut Games Application",
-                    description=(
-                        "Welcome to the **Donut Games** application.\n\n"
-                        "This is for the **main competition** and is aimed at more serious, committed players and viewers.\n\n"
-                        "**Important:** If you are selected, you are expected to show up and take part.\n"
-                        "If you do not show up, we may replace you with a reserve contestant.\n\n"
-                        "Please answer everything clearly and honestly."
-                    ),
-                    color=discord.Color.orange()
-                )
+            support_mentions = " ".join(role.mention for role in support_roles)
+            ping_line = f"{support_mentions} {user.mention}".strip() or user.mention
 
-                guidance_embed = discord.Embed(
-                    title="📌 Guidance",
-                    description=(
-                        "• Answer honestly and in your own words\n"
-                        "• Put effort into your answers\n"
-                        "• Joke or low-effort applications are unlikely to be accepted\n"
-                        "• **Using AI to write your application may result in your application being denied**"
-                    ),
-                    color=discord.Color.red()
-                )
-
-                questions = (
-                    "**Please answer these questions:**\n\n"
-                    "**1.** Discord username:\n"
-                    "**2.** Age:\n"
-                    "**3.** Minecraft in-game name:\n"
-                    "**4.** Twitch username:\n"
-                    "**5.** How much playtime do you have on DonutSMP?\n"
-                    "**6.** Do you have voice chat enabled and working?\n"
-                    "**7.** Why do you want to be part of Donut Games?\n"
-                    "**8.** What makes you a strong contestant?\n"
-                    "**9.** Have you taken part in events, competitions, or community activities before?\n"
-                    "**10.** Why should we pick you over someone else?\n"
-                    "**11.** Anything else you want staff to know?\n"
-                )
-            else:
-                intro_embed = discord.Embed(
-                    title="🎮 Mini-Games Application",
-                    description=(
-                        "Welcome to the **Mini-Games** application.\n\n"
-                        "This is for **live stream events, lighter competitions, and fun community participation**.\n\n"
-                        "Mini-Games are more casual than Donut Games, but we still want players who are genuine, fun, and reliable."
-                    ),
-                    color=discord.Color.blurple()
-                )
-
-                guidance_embed = discord.Embed(
-                    title="📌 Guidance",
-                    description=(
-                        "• Answer honestly and in your own words\n"
-                        "• Keep your answers clear and readable\n"
-                        "• Low-effort or joke applications are unlikely to be accepted\n"
-                        "• **Using AI to write your application may result in your application being denied**"
-                    ),
-                    color=discord.Color.red()
-                )
-
-                questions = (
-                    "**Please answer these questions:**\n\n"
-                    "**1.** Discord username:\n"
-                    "**2.** Age:\n"
-                    "**3.** Minecraft in-game name:\n"
-                    "**4.** Twitch username:\n"
-                    "**5.** How much playtime do you have on DonutSMP?\n"
-                    "**6.** Do you have voice chat enabled and working?\n"
-                    "**7.** What kind of mini-games or stream events would you like to join?\n"
-                    "**8.** What makes you fun to have in live events?\n"
-                    "**9.** Have you joined community or stream events before?\n"
-                    "**10.** Anything else you want us to know?\n"
-                )
-
-            await channel.send(f"{user.mention}")
-            await channel.send(embed=intro_embed)
-            await channel.send(embed=guidance_embed)
-            await channel.send(questions)
-
-            review_embed = discord.Embed(
-                title=f"📋 New {app_type} Application",
+            submitted_embed = discord.Embed(
+                title="🍩 Donut Games Application Submitted",
                 description=(
-                    f"**Applicant:** {user.mention}\n"
-                    f"**Channel:** {channel.mention}\n"
-                    f"**Type:** {app_type}\n\n"
-                    "Use the buttons below to manage this application."
+                    f"Thank you for applying, {user.mention}.\n\n"
+                    "Your application has been created and is now ready for staff review."
                 ),
+                color=discord.Color.orange()
+            )
+            submitted_embed.set_footer(text="Please wait patiently while staff review your application.")
+
+            answers_embed = discord.Embed(
+                title="Application Answers",
+                description=f"**Applicant:** {user.mention}",
                 color=discord.Color.gold()
             )
-
-            review_message = await review_channel.send(
-                embed=review_embed,
-                view=ReviewView(self.bot, user.id, channel.id, app_type)
+            answers_embed.add_field(name="Minecraft Username", value=self.part_one_answers["minecraft_username"], inline=False)
+            answers_embed.add_field(name="Where did you find us?", value=self.where_found_us.value, inline=False)
+            answers_embed.add_field(name="Timezone", value=self.part_one_answers["timezone"], inline=True)
+            answers_embed.add_field(name="Java or Bedrock", value=self.part_one_answers["java_or_bedrock"], inline=True)
+            answers_embed.add_field(name="In-Game Mic", value=self.part_one_answers["in_game_mic"], inline=True)
+            answers_embed.add_field(name="Age", value=self.part_one_answers["age"], inline=True)
+            answers_embed.add_field(
+                name="Have you competed in the games before? If so tell us more",
+                value=self.have_competed_before.value,
+                inline=False
+            )
+            answers_embed.add_field(
+                name="Are you going to follow the rules and not grief",
+                value=self.follow_rules.value,
+                inline=False
+            )
+            answers_embed.add_field(
+                name="Anything else you would like to add?",
+                value=self.anything_else.value.strip() if self.anything_else.value.strip() else "N/A",
+                inline=False
             )
 
-            data = normalize_active_applications(load_data())
-            data["active_applications"].setdefault(user_id_str, {})
-            data["active_applications"][user_id_str][app_type] = {
-                "channel_id": channel.id,
-                "app_type": app_type,
-                "review_message_id": review_message.id
-            }
-            save_data(data)
+            staff_embed = discord.Embed(
+                title="Staff Actions",
+                description="Support staff can manage this application using the buttons below.",
+                color=discord.Color.blurple()
+            )
+
+            await channel.send(ping_line)
+            await channel.send(embed=submitted_embed)
+            await channel.send(embed=answers_embed)
+            await channel.send(
+                embed=staff_embed,
+                view=ApplicationDecisionView(self.cog.bot, user.id, channel.id, app_type)
+            )
+
+            self.cog.pending_part_one.pop(user.id, None)
 
             await interaction.response.send_message(
-                f"✅ Your application channel has been created: {channel.mention}",
+                f"✅ Your **Donut Games** application has been submitted: {channel.mention}",
                 ephemeral=True
             )
+
+        except Exception as e:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
+            else:
+                await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+
+
+class ContinueApplicationView(discord.ui.View):
+    def __init__(self, cog: "Tickets", user_id: int):
+        super().__init__(timeout=600)
+        self.cog = cog
+        self.user_id = user_id
+
+    @discord.ui.button(label="Continue Application", style=discord.ButtonStyle.primary, emoji="➡️")
+    async def continue_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ This button is not for you.", ephemeral=True)
+            return
+
+        part_one_answers = self.cog.pending_part_one.get(self.user_id)
+        if not part_one_answers:
+            await interaction.response.send_message("❌ Your first form expired. Please start again.", ephemeral=True)
+            return
+
+        await interaction.response.send_modal(ApplicationPartTwoModal(self.cog, part_one_answers))
+
+
+class ApplicationPartOneModal(discord.ui.Modal, title="Donut Games Application • Part 1"):
+    def __init__(self, cog: "Tickets"):
+        super().__init__()
+        self.cog = cog
+
+        self.minecraft_username = discord.ui.TextInput(label="Minecraft Username", required=True, max_length=100)
+        self.timezone = discord.ui.TextInput(
+            label="Timezone",
+            required=True,
+            max_length=100,
+            placeholder="Example: GMT, EST, UTC+1"
+        )
+        self.java_or_bedrock = discord.ui.TextInput(
+            label="Java or Bedrock",
+            required=True,
+            max_length=50,
+            placeholder="Java, Bedrock, or both"
+        )
+        self.in_game_mic = discord.ui.TextInput(
+            label="In-Game Mic",
+            required=True,
+            max_length=100,
+            placeholder="Yes / No / Sometimes"
+        )
+        self.age = discord.ui.TextInput(label="Age", required=True, max_length=20)
+
+        self.add_item(self.minecraft_username)
+        self.add_item(self.timezone)
+        self.add_item(self.java_or_bedrock)
+        self.add_item(self.in_game_mic)
+        self.add_item(self.age)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        self.cog.pending_part_one[interaction.user.id] = {
+            "minecraft_username": self.minecraft_username.value.strip(),
+            "timezone": self.timezone.value.strip(),
+            "java_or_bedrock": self.java_or_bedrock.value.strip(),
+            "in_game_mic": self.in_game_mic.value.strip(),
+            "age": self.age.value.strip(),
+        }
+
+        await interaction.response.send_message(
+            "✅ Part 1 saved. Click below to continue to Part 2.",
+            ephemeral=True,
+            view=ContinueApplicationView(self.cog, interaction.user.id)
+        )
+
+
+class ApplyPanelView(discord.ui.View):
+    def __init__(self, cog: "Tickets"):
+        super().__init__(timeout=None)
+        self.cog = cog
+
+    @discord.ui.button(
+        label="Apply for Donut Games",
+        style=discord.ButtonStyle.primary,
+        emoji=DONUT_BUTTON_EMOJI,
+        custom_id="donut_games_apply_button"
+    )
+    async def apply_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            guild = interaction.guild
+            if guild is None:
+                await interaction.response.send_message("❌ This can only be used inside a server.", ephemeral=True)
+                return
+
+            data = normalize_data(load_data())
+            user_id_str = str(interaction.user.id)
+            app_type = "Donut Games"
+
+            existing_app = data["active_applications"].get(user_id_str, {}).get(app_type)
+            if existing_app:
+                existing_channel = guild.get_channel(existing_app["channel_id"])
+                if existing_channel:
+                    await interaction.response.send_message(
+                        f"❌ You already have an open **Donut Games** application: {existing_channel.mention}",
+                        ephemeral=True
+                    )
+                    return
+
+            await interaction.response.send_modal(ApplicationPartOneModal(self.cog))
 
         except Exception as e:
             if not interaction.response.is_done():
@@ -690,96 +939,120 @@ class ApplicationView(discord.ui.View):
 class Tickets(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        self.pending_part_one: Dict[int, Dict[str, str]] = {}
 
     async def cog_load(self):
-        self.bot.add_view(ApplicationView(self.bot))
-        await self._restore_review_views()
+        self.bot.add_view(ApplyPanelView(self))
+        await self._restore_application_views()
 
-    async def _restore_review_views(self):
-        data = normalize_active_applications(load_data())
+    async def _restore_application_views(self):
+        data = normalize_data(load_data())
         save_data(data)
 
         for user_id_str, apps in data.get("active_applications", {}).items():
             if not isinstance(apps, dict):
                 continue
 
-            for app_type, app_data in apps.items():
-                if not isinstance(app_data, dict):
-                    continue
+            donut_app = apps.get("Donut Games")
+            if not isinstance(donut_app, dict):
+                continue
 
-                channel_id = app_data.get("channel_id")
-                if not channel_id:
-                    continue
+            channel_id = donut_app.get("channel_id")
+            if not channel_id:
+                continue
 
-                status = get_application_status(data, int(user_id_str), app_type)
-                if status not in {"open", "under_review"}:
-                    continue
+            status = get_application_status(data, int(user_id_str), "Donut Games")
+            if status not in {"open", "under_review"}:
+                continue
 
-                self.bot.add_view(
-                    ReviewView(
-                        self.bot,
-                        applicant_id=int(user_id_str),
-                        app_channel_id=channel_id,
-                        app_type=app_type
-                    )
+            self.bot.add_view(
+                ApplicationDecisionView(
+                    self.bot,
+                    applicant_id=int(user_id_str),
+                    app_channel_id=channel_id,
+                    app_type="Donut Games"
                 )
+            )
 
     @commands.command()
     @commands.has_permissions(administrator=True)
-    async def setup_apply_panel(self, ctx):
+    async def setup_apply_panel_here(self, ctx):
+        if ctx.channel.id != APPLY_PANEL_CHANNEL_ID:
+            await ctx.send(f"⚠️ This command is intended for <#{APPLY_PANEL_CHANNEL_ID}>.")
+
         embed = discord.Embed(
-            title="🍩 Apply for Donut SMP Events",
+            title="🍩 Donut Games Applications",
             description=(
-                "Want to get involved in the action?\n\n"
-                "Choose an option below to open your **private application channel**.\n\n"
-                "**🍩 Donut Games**\n"
-                "Our main competition for more committed viewers and players.\n\n"
-                "**🎮 Mini-Games**\n"
-                "Fun live stream events, lighter competitions, and casual community participation.\n\n"
-                "Pick the option that fits you best and we’ll get you started."
+                "**Want to apply for Donut Games?**\n\n"
+                "Press the button below to begin your application.\n\n"
+                "Once completed, a **private application channel** will be created for staff review."
             ),
-            color=discord.Color.gold()
+            color=discord.Color.orange()
         )
-
-        embed.set_footer(
-            text="Applications are reviewed by staff. Make sure your answers are honest and complete."
+        embed.add_field(
+            name="Before You Apply",
+            value=(
+                "• Answer honestly\n"
+                "• Do not use AI"
+            ),
+            inline=False
         )
+        embed.set_footer(text="Applications are reviewed by support staff.")
 
-        await ctx.send(embed=embed, view=ApplicationView(self.bot))
+        await ctx.send(embed=embed, view=ApplyPanelView(self))
 
-    @commands.command()
+    @commands.command(name="appclose")
     @commands.has_permissions(manage_channels=True)
-    async def close(self, ctx):
+    async def appclose(self, ctx):
         channel = ctx.channel
-        if isinstance(channel, discord.TextChannel) and channel.category and channel.category.name == APPLICATION_CATEGORY_NAME:
-            data = normalize_active_applications(load_data())
+        if not isinstance(channel, discord.TextChannel):
+            await ctx.send("❌ Invalid channel.")
+            return
 
-            user_id_to_remove = None
-            app_type_to_remove = None
-
-            for user_id, apps in data["active_applications"].items():
-                if not isinstance(apps, dict):
-                    continue
-
-                for app_type, app_data in apps.items():
-                    if isinstance(app_data, dict) and app_data.get("channel_id") == channel.id:
-                        user_id_to_remove = user_id
-                        app_type_to_remove = app_type
-                        break
-
-                if user_id_to_remove:
-                    break
-
-            if user_id_to_remove and app_type_to_remove:
-                data["active_applications"][user_id_to_remove].pop(app_type_to_remove, None)
-                if not data["active_applications"][user_id_to_remove]:
-                    data["active_applications"].pop(user_id_to_remove, None)
-                save_data(data)
-
-            await ctx.send("⛔ Closing this application channel...")
-            await channel.delete()
-        else:
+        if not channel.category or channel.category.name != APPLICATION_CATEGORY_NAME:
             await ctx.send("❌ This command can only be used inside an application channel.")
+            return
+
+        data = normalize_data(load_data())
+        applicant_id = None
+        app_type = None
+
+        for user_id_str, apps in data["active_applications"].items():
+            if not isinstance(apps, dict):
+                continue
+
+            donut_app = apps.get("Donut Games")
+            if isinstance(donut_app, dict) and donut_app.get("channel_id") == channel.id:
+                applicant_id = int(user_id_str)
+                app_type = "Donut Games"
+                break
+
+        if applicant_id is None or app_type is None:
+            await ctx.send("❌ Could not find linked application data for this channel.")
+            return
+
+        countdown_view = ActionCountdownView(
+            applicant_id=applicant_id,
+            app_channel=channel,
+            app_type=app_type,
+            action="close",
+            acted_by=ctx.author,
+            reason="Closed by staff command."
+        )
+
+        countdown_message = await ctx.send(
+            embed=discord.Embed(
+                title="⏳ Close Scheduled",
+                description=(
+                    "This application will be **closed in 10 seconds**.\n\n"
+                    "Press **Cancel** below to stop it."
+                ),
+                color=discord.Color.orange()
+            ),
+            view=countdown_view
+        )
+
+        asyncio.create_task(countdown_view.begin(countdown_message))
 
 
 async def setup(bot):
